@@ -1,0 +1,14 @@
+{
+  "name": "omnifeed-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "OmniFeed Cloudflare Worker for ticker submission",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}

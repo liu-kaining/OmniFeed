@@ -1,0 +1,17 @@
+name = "omnifeed-worker"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+# R2 bucket binding
+[[r2_buckets]]
+binding = "R2_BUCKET"
+bucket_name = "omnifeed-bucket"
+
+# Environment variables (set via `wrangler secret put`)
+# TURNSTILE_SECRET_KEY - Cloudflare Turnstile secret key
+
+# Custom domain (optional)
+# [env.production]
+# routes = [
+#   { pattern = "api.omnifeed.pages.dev/*", zone_name = "omnifeed.pages.dev" }
+# ]

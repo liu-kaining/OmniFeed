@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="OmniFeed - AI驱动型金融另类数据情报站">
+    <title>OmniFeed - 金融另类数据情报站</title>
+    <link rel="stylesheet" href="css/style.css">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📊</text></svg>">
+</head>
+<body>
+    <!-- Header -->
+    <header class="header">
+        <div class="header-content">
+            <h1 class="logo">
+                <span class="logo-icon">📊</span>
+                <span class="logo-text">OmniFeed</span>
+            </h1>
+            <nav class="nav">
+                <button class="nav-btn active" data-view="timeline">
+                    ⏱️ 另类情报全量流
+                </button>
+                <button class="nav-btn" data-view="congress">
+                    🏛️ 参议院交易
+                </button>
+                <button class="nav-btn" data-view="insider">
+                    💼 内幕交易
+                </button>
+                <button class="nav-btn" data-view="articles">
+                    📰 独家舆情
+                </button>
+            </nav>
+            <div class="header-actions">
+                <button class="btn-raw-json" onclick="toggleRawJSON()">
+                    [ Raw JSON ]
+                </button>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main Content -->
+    <main class="main">
+        <!-- Sidebar: Ticker Hub -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <h2>📋 监控标的 (Ticker Hub)</h2>
+                <button class="btn-filter active" data-filter="all">ALL 全部标的</button>
+            </div>
+
+            <div class="ticker-grid" id="tickerGrid">
+                <!-- Ticker cards will be populated by JS -->
+            </div>
+
+            <!-- Ticker Submission Form -->
+            <div class="ticker-submit">
+                <button class="btn-add-ticker" id="btnAddTicker">
+                    ➕ 提报新标的 (心愿单)
+                </button>
+                <div class="submit-form hidden" id="submitForm">
+                    <input
+                        type="text"
+                        id="tickerInput"
+                        placeholder="输入股票代码 (如: AMD)"
+                        maxlength="5"
+                        autocomplete="off"
+                    >
+                    <button class="btn-submit" id="btnSubmit">提交</button>
+                    <button class="btn-cancel" id="btnCancel">取消</button>
+                    <div class="submit-message" id="submitMessage"></div>
+                    <div class="turnstile-container" id="turnstileContainer"></div>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Main Feed -->
+        <section class="feed-container">
+            <div class="feed-header">
+                <h2 id="feedTitle">⏱️ 另类情报全量流</h2>
+                <div class="feed-stats" id="feedStats">
+                    <!-- Stats will be populated by JS -->
+                </div>
+            </div>
+
+            <div class="feed-list" id="feedList">
+                <!-- Feed cards will be populated by JS -->
+                <div class="loading" id="loading">
+                    <div class="loading-spinner"></div>
+                    <p>正在加载情报数据...</p>
+                </div>
+            </div>
+
+            <!-- Raw JSON Modal -->
+            <div class="raw-json-modal hidden" id="rawJsonModal">
+                <div class="modal-header">
+                    <h3>Raw JSON Data</h3>
+                    <button class="btn-close" onclick="toggleRawJSON()">×</button>
+                </div>
+                <pre class="json-content" id="jsonContent"></pre>
+            </div>
+        </section>
+    </main>
+
+    <!-- Footer -->
+    <footer class="footer">
+        <p>OmniFeed - AI驱动型金融另类数据情报站 | 数据来源: SEC, FMP, 国会披露</p>
+    </footer>
+
+    <script src="js/app.js"></script>
+</body>
+</html>
