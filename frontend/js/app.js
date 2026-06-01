@@ -5,9 +5,10 @@
  */
 
 // API endpoints
-const API_BASE = '/api';
-const FEEDS_URL = 'feeds/latest_feeds.json';
-const SYMBOLS_URL = 'symbols/';
+const API_BASE = window.OMNIFEED_API_BASE || '/api';
+const FEEDS_BASE = window.OMNIFEED_FEEDS_BASE || '';
+const FEEDS_URL = `${FEEDS_BASE}/feeds/latest_feeds.json`;
+const SYMBOLS_URL = `${FEEDS_BASE}/symbols/`;
 
 // Application state
 const state = {
@@ -21,6 +22,16 @@ const state = {
 
 // DOM elements
 const elements = {};
+
+/**
+ * Escape HTML to prevent XSS injection
+ */
+function escapeHtml(str) {
+    if (!str) return '';
+    const div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+}
 
 /**
  * Initialize the application
@@ -166,7 +177,7 @@ function renderTickerGrid() {
 
         card.innerHTML = `
             <div class="ticker-header">
-                <span class="ticker-symbol">${ticker}.US</span>
+                <span class="ticker-symbol">${escapeHtml(ticker)}.US</span>
                 <span class="resonance-index ${getResonanceClass(resonance)}">
                     ${getResonanceEmoji(resonance)} ${resonance}
                 </span>
@@ -339,15 +350,15 @@ function createFeedCard(feed) {
             <div class="feed-financials">
                 <span class="${actionClass}">● ${actionLabel}</span>
                 ${feed.financials.valueRange ?
-                    `<span class="feed-value-range">${feed.financials.valueRange}</span>` :
+                    `<span class="feed-value-range">${escapeHtml(feed.financials.valueRange)}</span>` :
                     ''
                 }
                 ${feed.financials.volume ?
-                    `<span>${feed.financials.volume.toLocaleString()}股</span>` :
+                    `<span>${Number(feed.financials.volume).toLocaleString()}股</span>` :
                     ''
                 }
                 ${feed.financials.price ?
-                    `<span>@ $${feed.financials.price.toFixed(2)}</span>` :
+                    `<span>@ $${Number(feed.financials.price).toFixed(2)}</span>` :
                     ''
                 }
             </div>
@@ -365,33 +376,33 @@ function createFeedCard(feed) {
         <div class="feed-card-header">
             <div>
                 <span class="feed-source ${sourceClass}">${sourceLabel}</span>
-                <span class="feed-ticker">${feed.ticker}.US</span>
+                <span class="feed-ticker">${escapeHtml(feed.ticker)}.US</span>
             </div>
-            <span class="feed-time">${timeAgo}</span>
+            <span class="feed-time">${escapeHtml(timeAgo)}</span>
         </div>
 
         <div class="feed-actor">
-            <strong>${feed.actor.nameZh}</strong>
+            <strong>${escapeHtml(feed.actor.nameZh)}</strong>
             ${feed.actor.nameEn !== feed.actor.nameZh ?
-                `<span style="color: var(--text-muted); font-size: 0.8rem;"> (${feed.actor.nameEn})</span>` :
+                `<span style="color: var(--text-muted); font-size: 0.8rem;"> (${escapeHtml(feed.actor.nameEn)})</span>` :
                 ''
             }
         </div>
-        <div class="feed-actor-identity">${feed.actor.identityZh}</div>
+        <div class="feed-actor-identity">${escapeHtml(feed.actor.identityZh)}</div>
 
         ${financialsHtml}
 
         <div class="feed-content">
-            <div class="feed-title-zh">${feed.content.titleZh}</div>
-            <div class="feed-body-zh">${insightHtml}</div>
+            <div class="feed-title-zh">${escapeHtml(feed.content.titleZh)}</div>
+            <div class="feed-body-zh">${escapeHtml(feed.content.bodyZh)}</div>
         </div>
 
         <div class="feed-footer">
-            <a href="${feed.sourceUrl}" target="_blank" rel="noopener" class="feed-source-link">
+            <a href="${escapeHtml(feed.sourceUrl)}" target="_blank" rel="noopener noreferrer" class="feed-source-link">
                 查看原始来源 →
             </a>
             <span style="color: var(--text-muted); font-family: var(--font-mono); font-size: 0.7rem;">
-                ${feed.eventId.substring(0, 8)}...
+                ${escapeHtml(feed.eventId.substring(0, 8))}...
             </span>
         </div>
     `;

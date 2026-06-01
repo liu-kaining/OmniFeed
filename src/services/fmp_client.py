@@ -4,6 +4,7 @@ This module provides a client for fetching financial data from FMP API,
 including insider trading and stock news.
 """
 
+import asyncio
 import logging
 from datetime import datetime, timedelta
 from typing import Any, Optional
@@ -13,6 +14,18 @@ import httpx
 from src.utils.config import FMPConfig
 
 logger = logging.getLogger(__name__)
+
+# Rate limiter: max concurrent requests
+_MAX_CONCURRENT = 5
+_semaphore: Optional[asyncio.Semaphore] = None
+
+
+def _get_semaphore() -> asyncio.Semaphore:
+    """Get or create semaphore for rate limiting."""
+    global _semaphore
+    if _semaphore is None:
+        _semaphore = asyncio.Semaphore(_MAX_CONCURRENT)
+    return _semaphore
 
 
 class FMPClient:
@@ -124,14 +137,26 @@ class FMPClient:
         """
         to_date = datetime.now().strftime("%Y-%m-%d")
         from_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+        semaphore = _get_semaphore()
+
+        async def fetch_with_limit(symbol: str) -> tuple[str, list[dict[str, Any]]]:
+            async with semaphore:
+                records = await self.get_insider_trading(
+                    symbol=symbol,
+                    from_date=from_date,
+                    to_date=to_date,
+                )
+                return symbol, records
+
+        tasks = [fetch_with_limit(symbol) for symbol in symbols]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
         result: dict[str, list[dict[str, Any]]] = {}
-        for symbol in symbols:
-            records = await self.get_insider_trading(
-                symbol=symbol,
-                from_date=from_date,
-                to_date=to_date,
-            )
+        for item in results:
+            if isinstance(item, Exception):
+                logger.error(f"Batch insider trading fetch failed: {item}")
+                continue
+            symbol, records = item
             if records:
                 result[symbol] = records
         return result
@@ -153,17 +178,32 @@ class FMPClient:
         to_date = datetime.now().strftime("%Y-%m-%d")
         from_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
 
-        articles = await self.get_stock_news(
-            tickers=symbols,
-            from_date=from_date,
-            to_date=to_date,
-        )
+        # Split symbols into batches of 10 to avoid API limits
+        batch_size = 10
+        symbol_batches = [symbols[i:i + batch_size] for i in range(0, len(symbols), batch_size)]
+        semaphore = _get_semaphore()
+
+        async def fetch_batch(batch: list[str]) -> list[dict[str, Any]]:
+            async with semaphore:
+                return await self.get_stock_news(
+                    tickers=batch,
+                    from_date=from_date,
+                    to_date=to_date,
+                )
+
+        tasks = [fetch_batch(batch) for batch in symbol_batches]
+        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
 
         result: dict[str, list[dict[str, Any]]] = {}
-        for article in articles:
-            ticker = article.get("symbol", "")
-            if ticker:
-                if ticker not in result:
-                    result[ticker] = []
-                result[ticker].append(article)
+        for item in batch_results:
+            if isinstance(item, Exception):
+                logger.error(f"Batch stock news fetch failed: {item}")
+                continue
+            articles = item
+            for article in articles:
+                ticker = article.get("symbol", "")
+                if ticker:
+                    if ticker not in result:
+                        result[ticker] = []
+                    result[ticker].append(article)
         return result

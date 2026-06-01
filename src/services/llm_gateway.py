@@ -7,6 +7,7 @@ Includes circuit breaker for graceful degradation.
 
 import json
 import logging
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import httpx
@@ -21,6 +22,44 @@ logger = logging.getLogger(__name__)
 _circuit_open = False
 _failure_count = 0
 _MAX_FAILURES = 3
+_CIRCUIT_R2_KEY = "snapshot/circuit_breaker.json"
+_r2_client: Any = None  # Will be set by ETL pipeline
+
+
+def set_r2_client(r2_client: Any) -> None:
+    """Set R2 client for circuit breaker persistence."""
+    global _r2_client
+    _r2_client = r2_client
+
+
+def _load_circuit_state() -> None:
+    """Load circuit breaker state from R2."""
+    global _circuit_open, _failure_count
+    if _r2_client is None:
+        return
+    try:
+        data = _r2_client.get_object(_CIRCUIT_R2_KEY)
+        if data:
+            _circuit_open = data.get("circuit_open", False)
+            _failure_count = data.get("failure_count", 0)
+            logger.info(f"Loaded circuit state: open={_circuit_open}, failures={_failure_count}")
+    except Exception as e:
+        logger.warning(f"Failed to load circuit state: {e}")
+
+
+def _save_circuit_state() -> None:
+    """Save circuit breaker state to R2."""
+    if _r2_client is None:
+        return
+    try:
+        data = {
+            "circuit_open": _circuit_open,
+            "failure_count": _failure_count,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _r2_client.put_object(_CIRCUIT_R2_KEY, data)
+    except Exception as e:
+        logger.warning(f"Failed to save circuit state: {e}")
 
 
 def reset_circuit_breaker() -> None:
@@ -28,10 +67,12 @@ def reset_circuit_breaker() -> None:
     global _circuit_open, _failure_count
     _circuit_open = False
     _failure_count = 0
+    _save_circuit_state()
 
 
 def is_circuit_open() -> bool:
     """Check if the circuit breaker is open."""
+    _load_circuit_state()
     return _circuit_open
 
 
@@ -42,12 +83,14 @@ def _record_failure() -> None:
     if _failure_count >= _MAX_FAILURES:
         _circuit_open = True
         logger.warning("LLM circuit breaker opened due to repeated failures")
+    _save_circuit_state()
 
 
 def _record_success() -> None:
     """Record a success and reset failure count."""
     global _failure_count
     _failure_count = 0
+    _save_circuit_state()
 
 
 # Prompt templates for different event types
@@ -206,6 +249,36 @@ class LLMGateway:
         chunk_size = self._config.chunk_size
         return [data[i:i + chunk_size] for i in range(0, len(data), chunk_size)]
 
+    def _parse_llm_response(self, response: str) -> list[dict[str, Any]]:
+        """Parse LLM response with defensive error handling.
+
+        Args:
+            response: Raw LLM response string.
+
+        Returns:
+            Parsed list of results.
+        """
+        try:
+            parsed = json.loads(response)
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse LLM response as JSON: {e}")
+            return []
+
+        # Handle different response formats
+        if isinstance(parsed, list):
+            return parsed
+        elif isinstance(parsed, dict):
+            # Try common response keys
+            results = parsed.get("results", parsed.get("items", parsed.get("data", [])))
+            if isinstance(results, list):
+                return results
+            elif results is not None:
+                return [results]
+            return []
+        elif parsed is not None:
+            return [parsed]
+        return []
+
     async def process_congress_trades(
         self, trades: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
@@ -223,9 +296,9 @@ class LLMGateway:
             prompt = CONGRESS_PROMPT.format(data=json.dumps(chunk, default=str))
             try:
                 response = await self.process_batch(prompt)
-                results = json.loads(response)
-                if isinstance(results, dict) and "results" in results:
-                    results = results["results"]
+                results = self._parse_llm_response(response)
+                if not isinstance(results, list):
+                    results = [results] if results else []
                 all_results.extend(results)
             except Exception as e:
                 logger.error(f"Failed to process congress batch: {e}")
@@ -250,9 +323,9 @@ class LLMGateway:
             prompt = INSIDER_PROMPT.format(data=json.dumps(chunk, default=str))
             try:
                 response = await self.process_batch(prompt)
-                results = json.loads(response)
-                if isinstance(results, dict) and "results" in results:
-                    results = results["results"]
+                results = self._parse_llm_response(response)
+                if not isinstance(results, list):
+                    results = [results] if results else []
                 all_results.extend(results)
             except Exception as e:
                 logger.error(f"Failed to process insider batch: {e}")
@@ -277,9 +350,9 @@ class LLMGateway:
             prompt = ARTICLE_PROMPT.format(data=json.dumps(chunk, default=str))
             try:
                 response = await self.process_batch(prompt)
-                results = json.loads(response)
-                if isinstance(results, dict) and "results" in results:
-                    results = results["results"]
+                results = self._parse_llm_response(response)
+                if not isinstance(results, list):
+                    results = [results] if results else []
                 all_results.extend(results)
             except Exception as e:
                 logger.error(f"Failed to process article batch: {e}")

@@ -150,12 +150,15 @@ class R2Client:
         """
         try:
             body = json.dumps(data, ensure_ascii=False, default=str, indent=2)
+            # Strip quotes from ETag if present (boto3 returns ETag with quotes)
+            clean_etag = expected_etag.strip('"')
             self._client.put_object(
                 Bucket=self._config.bucket_name,
                 Key=key,
                 Body=body.encode("utf-8"),
                 ContentType="application/json",
-                **{"IfMatch": expected_etag},
+                ExpectedBucketOwner="",  # Not used but required for conditional
+                **{"IfMatch": clean_etag},
             )
             return True
         except ClientError as e:

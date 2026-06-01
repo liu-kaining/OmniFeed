@@ -20,8 +20,9 @@ from src.models.feed import (
     FeedEvent,
     Financials,
 )
+from src.services.congress_client import CongressClient
 from src.services.fmp_client import FMPClient
-from src.services.llm_gateway import LLMGateway
+from src.services.llm_gateway import LLMGateway, set_r2_client
 from src.services.r2_client import R2Client
 from src.services.rss_generator import generate_congress_rss, generate_insider_rss
 from src.utils.config import AppConfig, load_config
@@ -42,8 +43,11 @@ class ETLPipeline:
     def __init__(self, config: AppConfig | None = None) -> None:
         self._config = config or load_config()
         self._fmp = FMPClient(self._config.fmp)
+        self._congress = CongressClient(self._config)
         self._llm = LLMGateway(self._config.llm)
         self._r2 = R2Client(self._config.r2)
+        # Set R2 client for circuit breaker persistence
+        set_r2_client(self._r2)
 
     async def run(self) -> dict[str, Any]:
         """Execute the full ETL pipeline.
@@ -57,10 +61,17 @@ class ETLPipeline:
         # Load current state from R2
         whitelist = self._r2.load_whitelist()
         window_data = self._r2.load_sliding_window()
-        window: dict[str, datetime] = {
-            eid: datetime.fromisoformat(ts) if isinstance(ts, str) else ts
-            for eid, ts in window_data.items()
-        }
+        window: dict[str, datetime] = {}
+        for eid, ts in window_data.items():
+            try:
+                if isinstance(ts, str):
+                    window[eid] = datetime.fromisoformat(ts)
+                elif isinstance(ts, datetime):
+                    window[eid] = ts
+                else:
+                    logger.warning(f"Invalid timestamp type for event {eid}: {type(ts)}")
+            except (ValueError, TypeError) as e:
+                logger.warning(f"Failed to parse timestamp for event {eid}: {e}")
 
         # Prune expired entries
         window = prune_expired_entries(window)
@@ -115,6 +126,7 @@ class ETLPipeline:
             raise
         finally:
             await self._fmp.close()
+            await self._congress.close()
             await self._llm.close()
 
     async def _process_congress_data(
@@ -250,13 +262,18 @@ class ETLPipeline:
     ) -> list[dict[str, Any]]:
         """Fetch Congress trading data.
 
-        This is a placeholder implementation. In production, this would
-        connect to the Senate/House Electronic Filing System or use
-        a third-party API like Quiver Quantitative.
+        Uses CongressClient to fetch from Quiver Quantitative or Capitol Trades API.
         """
-        # Placeholder: In production, implement actual Congress data fetching
-        logger.info("Congress data fetching not yet implemented (placeholder)")
-        return []
+        try:
+            raw_trades = await self._congress.get_congress_trades(
+                tickers=tickers,
+                days_back=7,
+            )
+            logger.info(f"Fetched {len(raw_trades)} Congress trades")
+            return raw_trades
+        except Exception as e:
+            logger.error(f"Failed to fetch Congress trades: {e}")
+            return []
 
     def _build_congress_event(
         self, raw: dict[str, Any], llm_result: dict[str, Any]

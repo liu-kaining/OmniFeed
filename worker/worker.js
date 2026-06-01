@@ -18,15 +18,27 @@ const MAX_RETRY_DELAY = 300;
 // Max retry attempts
 const MAX_RETRIES = 5;
 
+// Rate limiting: max submissions per IP per hour
+const RATE_LIMIT_PER_HOUR = 10;
+
+// Allowed origins for CORS
+const ALLOWED_ORIGINS = [
+  "https://omnifeed.pages.dev",
+  "http://localhost:3000",
+  "http://localhost:8080",
+];
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    const origin = request.headers.get("Origin") || "";
 
-    // CORS headers
+    // CORS headers - restrict to allowed origins
     const corsHeaders = {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "POST, OPTIONS",
+      "Access-Control-Allow-Origin": ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0],
+      "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type",
+      "Access-Control-Max-Age": "86400",
     };
 
     // Handle CORS preflight
@@ -69,6 +81,15 @@ async function handleSubmitTicker(request, env, corsHeaders) {
     // Sanitize: trim whitespace and uppercase
     const sanitizedTicker = ticker.trim().toUpperCase();
 
+    // Additional security: block common injection patterns
+    if (sanitizedTicker.includes('..') || sanitizedTicker.includes('/') || sanitizedTicker.includes('\\')) {
+      return jsonResponse(
+        { error: "Invalid ticker format" },
+        400,
+        corsHeaders
+      );
+    }
+
     // Regex validation: 1-5 uppercase letters only
     if (!TICKER_REGEX.test(sanitizedTicker)) {
       return jsonResponse(
@@ -80,19 +101,34 @@ async function handleSubmitTicker(request, env, corsHeaders) {
       );
     }
 
-    // Verify Turnstile token (if configured)
-    if (env.TURNSTILE_SECRET_KEY) {
-      const turnstileValid = await verifyTurnstile(
-        turnstileToken,
-        env.TURNSTILE_SECRET_KEY
+    // Verify Turnstile token (required)
+    if (!env.TURNSTILE_SECRET_KEY) {
+      console.error("TURNSTILE_SECRET_KEY not configured");
+      return jsonResponse(
+        { error: "Service configuration error" },
+        500,
+        corsHeaders
       );
-      if (!turnstileValid) {
-        return jsonResponse(
-          { error: "Human verification failed. Please try again." },
-          403,
-          corsHeaders
-        );
-      }
+    }
+
+    if (!turnstileToken) {
+      return jsonResponse(
+        { error: "Human verification token is required" },
+        400,
+        corsHeaders
+      );
+    }
+
+    const turnstileValid = await verifyTurnstile(
+      turnstileToken,
+      env.TURNSTILE_SECRET_KEY
+    );
+    if (!turnstileValid) {
+      return jsonResponse(
+        { error: "Human verification failed. Please try again." },
+        403,
+        corsHeaders
+      );
     }
 
     // Attempt to add ticker with optimistic locking
