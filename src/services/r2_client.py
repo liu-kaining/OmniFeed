@@ -228,3 +228,17 @@ class R2Client:
             "lastUpdated": datetime.now(timezone.utc).isoformat(),
         }
         return self.put_object(key, data)
+
+    def load_latest_feeds(self, key: str = "feeds/latest_feeds.json") -> list[dict[str, Any]]:
+        """Load the global feed snapshot from R2."""
+        data = self.get_object(key)
+        if isinstance(data, list):
+            return data
+        return []
+
+    def load_ticker_feeds(self, ticker: str) -> list[dict[str, Any]]:
+        """Load per-ticker feed snapshot from R2."""
+        data = self.get_object(f"symbols/{ticker}.json")
+        if isinstance(data, list):
+            return data
+        return []

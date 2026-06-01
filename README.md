@@ -74,15 +74,14 @@ OmniFeed/
 
 ### 1. 环境配置
 
-复制环境变量模板:
-```bash
-cp .env.example .env
-```
+**所有配置项统一在 `config/` 目录**，完整说明见 **[config/README.md](config/README.md)**（含 GitHub Secrets 配置指南）。
 
-编辑 `.env` 填入你的 API 密钥:
-- `FMP_API_KEY` - Financial Modeling Prep API 密钥
-- `LLM_API_KEY` - LLM 服务 API 密钥 (DeepSeek/OpenAI)
-- `R2_*` - Cloudflare R2 存储配置
+```bash
+cp config/omnifeed.env.example .env
+# 编辑 .env 填入 API Key
+
+python scripts/generate_frontend_config.py   # 生成 frontend/config.js
+```
 
 ### 2. 安装依赖
 
@@ -113,18 +112,7 @@ npx wrangler deploy
 
 ## GitHub Actions 配置
 
-在仓库 Settings > Secrets 中配置:
-
-| Secret | 说明 |
-|--------|------|
-| `FMP_API_KEY` | FMP API 密钥 |
-| `LLM_API_KEY` | LLM 服务密钥 |
-| `LLM_BASE_URL` | LLM API 端点 |
-| `R2_ACCOUNT_ID` | Cloudflare 账户 ID |
-| `R2_ACCESS_KEY_ID` | R2 访问密钥 ID |
-| `R2_SECRET_ACCESS_KEY` | R2 密钥 |
-| `R2_BUCKET_NAME` | R2 存储桶名称 |
-| `CLOUDFLARE_API_TOKEN` | Cloudflare API 令牌 |
+详见 **[config/README.md](config/README.md)** — 包含所有必填/可选 Secrets 清单、各 Workflow 使用的变量、Worker wrangler secrets 注入方式。
 
 ## 数据源
 

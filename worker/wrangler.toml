@@ -9,6 +9,7 @@ bucket_name = "omnifeed-bucket"
 
 # Environment variables (set via `wrangler secret put`)
 # TURNSTILE_SECRET_KEY - Cloudflare Turnstile secret key
+# ALLOWED_ORIGIN - Optional comma-separated extra CORS origins
 
 # Custom domain (optional)
 # [env.production]

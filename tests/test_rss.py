@@ -109,7 +109,7 @@ class TestFormatRssDate:
         """Test formatting UTC datetime."""
         dt = datetime(2026, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
         result = _format_rss_date(dt)
-        assert "Sun, 01 Jun 2026 12:30:00 GMT" == result
+        assert "Mon, 01 Jun 2026 12:30:00 GMT" == result
 
     def test_format_naive_datetime(self):
         """Test formatting naive datetime (assumed UTC)."""
@@ -158,7 +158,7 @@ class TestGenerateCongressRss:
         """Test that build date is included."""
         build_time = datetime(2026, 6, 3, 12, 0, 0, tzinfo=timezone.utc)
         rss = generate_congress_rss(sample_congress_events, build_time)
-        assert "Mon, 03 Jun 2026 12:00:00 GMT" in rss
+        assert "Wed, 03 Jun 2026 12:00:00 GMT" in rss
 
 
 class TestGenerateInsiderRss:

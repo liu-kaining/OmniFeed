@@ -9,11 +9,10 @@ This module implements the core ETL pipeline that:
 """
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 from src.models.feed import (
-    ActionType,
     Actor,
     Content,
     EventSource,
@@ -25,7 +24,7 @@ from src.services.fmp_client import FMPClient
 from src.services.llm_gateway import LLMGateway, set_r2_client
 from src.services.r2_client import R2Client
 from src.services.rss_generator import generate_congress_rss, generate_insider_rss
-from src.utils.config import AppConfig, load_config
+from src.utils.config import AppConfig, DEFAULT_TICKERS, load_config
 from src.utils.fingerprint import (
     compute_article_event_id,
     compute_congress_event_id,
@@ -33,6 +32,7 @@ from src.utils.fingerprint import (
     filter_new_events,
     prune_expired_entries,
 )
+from src.utils.trading import parse_action_type
 
 logger = logging.getLogger(__name__)
 
@@ -42,52 +42,36 @@ class ETLPipeline:
 
     def __init__(self, config: AppConfig | None = None) -> None:
         self._config = config or load_config()
+        self._dry_run = self._config.dry_run
+        self._days_back = self._config.etl.days_back
+        self._max_feed_items = self._config.etl.max_feed_items
         self._fmp = FMPClient(self._config.fmp)
         self._congress = CongressClient(self._config)
         self._llm = LLMGateway(self._config.llm)
         self._r2 = R2Client(self._config.r2)
-        # Set R2 client for circuit breaker persistence
         set_r2_client(self._r2)
 
     async def run(self) -> dict[str, Any]:
-        """Execute the full ETL pipeline.
-
-        Returns:
-            Summary of the pipeline execution.
-        """
+        """Execute the full ETL pipeline."""
         logger.info("Starting ETL pipeline execution")
+        if self._dry_run:
+            logger.info("DRY_RUN enabled — R2 writes will be skipped")
+
         start_time = datetime.now(timezone.utc)
+        whitelist = self._resolve_whitelist()
+        window = self._load_sliding_window()
 
-        # Load current state from R2
-        whitelist = self._r2.load_whitelist()
-        window_data = self._r2.load_sliding_window()
-        window: dict[str, datetime] = {}
-        for eid, ts in window_data.items():
-            try:
-                if isinstance(ts, str):
-                    window[eid] = datetime.fromisoformat(ts)
-                elif isinstance(ts, datetime):
-                    window[eid] = ts
-                else:
-                    logger.warning(f"Invalid timestamp type for event {eid}: {type(ts)}")
-            except (ValueError, TypeError) as e:
-                logger.warning(f"Failed to parse timestamp for event {eid}: {e}")
-
-        # Prune expired entries
-        window = prune_expired_entries(window)
-
-        # Initialize summary
-        summary = {
+        summary: dict[str, Any] = {
             "start_time": start_time.isoformat(),
             "tickers_processed": len(whitelist),
             "new_congress_events": 0,
             "new_insider_events": 0,
             "new_article_events": 0,
+            "dry_run": self._dry_run,
             "errors": [],
         }
 
         try:
-            # Process each data source
             congress_events = await self._process_congress_data(whitelist, window)
             insider_events = await self._process_insider_data(whitelist, window)
             article_events = await self._process_article_data(whitelist, window)
@@ -96,26 +80,23 @@ class ETLPipeline:
             summary["new_insider_events"] = len(insider_events)
             summary["new_article_events"] = len(article_events)
 
-            # Combine all events
-            all_events = congress_events + insider_events + article_events
+            new_events = congress_events + insider_events + article_events
+            summary["total_new_events"] = len(new_events)
 
-            if all_events:
-                # Sort by timestamp (most recent first)
-                all_events.sort(key=lambda e: e.event_timestamp, reverse=True)
+            if new_events:
+                self._update_sliding_window(window, new_events)
 
-                # Store feeds
-                self._store_feeds(all_events, congress_events, insider_events)
+            if not self._dry_run:
+                self._r2.save_sliding_window(window)
+            else:
+                logger.info("DRY_RUN: skipping sliding window save")
 
-                # Update sliding window
-                self._update_sliding_window(window, all_events)
-
-            # Save updated sliding window
-            self._r2.save_sliding_window(window)
+            if new_events:
+                self._store_feeds(new_events)
 
             end_time = datetime.now(timezone.utc)
             summary["end_time"] = end_time.isoformat()
             summary["duration_seconds"] = (end_time - start_time).total_seconds()
-            summary["total_new_events"] = len(all_events)
 
             logger.info(f"ETL pipeline completed: {summary}")
             return summary
@@ -129,53 +110,63 @@ class ETLPipeline:
             await self._congress.close()
             await self._llm.close()
 
+    def _resolve_whitelist(self) -> list[str]:
+        """Load whitelist from R2, falling back to defaults when empty."""
+        whitelist = self._r2.load_whitelist()
+        if whitelist:
+            return whitelist
+
+        logger.info(f"Whitelist empty, using {len(DEFAULT_TICKERS)} default tickers")
+        if not self._dry_run:
+            self._r2.save_whitelist(list(DEFAULT_TICKERS))
+        return list(DEFAULT_TICKERS)
+
+    def _load_sliding_window(self) -> dict[str, datetime]:
+        window_data = self._r2.load_sliding_window()
+        window: dict[str, datetime] = {}
+        for eid, ts in window_data.items():
+            try:
+                if isinstance(ts, str):
+                    window[eid] = datetime.fromisoformat(ts)
+                elif isinstance(ts, datetime):
+                    window[eid] = ts
+                else:
+                    logger.warning(f"Invalid timestamp type for event {eid}: {type(ts)}")
+            except (ValueError, TypeError) as e:
+                logger.warning(f"Failed to parse timestamp for event {eid}: {e}")
+        return prune_expired_entries(window)
+
     async def _process_congress_data(
         self,
         tickers: list[str],
         window: dict[str, datetime],
     ) -> list[FeedEvent]:
-        """Process Congress trading data."""
         logger.info("Processing Congress trading data")
-
-        # FMP doesn't have a direct Congress API, so we simulate with placeholder
-        # In production, this would connect to Senate/House disclosure APIs
         raw_trades = await self._fetch_congress_trades(tickers)
-
         if not raw_trades:
             return []
 
-        # Compute event IDs and filter new events
-        event_ids = []
-        for trade in raw_trades:
-            eid = compute_congress_event_id(
+        event_ids = [
+            compute_congress_event_id(
                 stock_ticker=trade.get("ticker", ""),
                 last_name=trade.get("lastName", ""),
                 disclosure_date=trade.get("disclosureDate", ""),
                 amount=trade.get("amount", ""),
                 transaction_type=trade.get("type", ""),
             )
-            event_ids.append(eid)
-
-        new_ids = filter_new_events(window, event_ids)
-
-        # Filter to only new trades
-        new_trades = [
-            t for t, eid in zip(raw_trades, event_ids) if eid in new_ids
+            for trade in raw_trades
         ]
-
+        new_ids = set(filter_new_events(window, event_ids))
+        new_trades = [t for t, eid in zip(raw_trades, event_ids) if eid in new_ids]
         if not new_trades:
             return []
 
-        # Process through LLM
         processed = await self._llm.process_congress_trades(new_trades)
-
-        # Convert to FeedEvents
-        events = []
+        events: list[FeedEvent] = []
         for trade, llm_result in zip(new_trades, processed):
             event = self._build_congress_event(trade, llm_result)
             if event:
                 events.append(event)
-
         return events
 
     async def _process_insider_data(
@@ -183,11 +174,8 @@ class ETLPipeline:
         tickers: list[str],
         window: dict[str, datetime],
     ) -> list[FeedEvent]:
-        """Process insider trading data."""
         logger.info("Processing insider trading data")
-
-        # Fetch insider trades from FMP
-        raw_trades = await self._fmp.get_batch_insider_trading(tickers, days_back=7)
+        raw_trades = await self._fmp.get_batch_insider_trading(tickers, days_back=self._days_back)
 
         all_new_trades: list[dict[str, Any]] = []
         for symbol, trades in raw_trades.items():
@@ -207,16 +195,12 @@ class ETLPipeline:
         if not all_new_trades:
             return []
 
-        # Process through LLM
         processed = await self._llm.process_insider_trades(all_new_trades)
-
-        # Convert to FeedEvents
-        events = []
+        events: list[FeedEvent] = []
         for trade, llm_result in zip(all_new_trades, processed):
             event = self._build_insider_event(trade, llm_result)
             if event:
                 events.append(event)
-
         return events
 
     async def _process_article_data(
@@ -224,11 +208,8 @@ class ETLPipeline:
         tickers: list[str],
         window: dict[str, datetime],
     ) -> list[FeedEvent]:
-        """Process news article data."""
         logger.info("Processing news article data")
-
-        # Fetch articles from FMP
-        raw_articles = await self._fmp.get_batch_stock_news(tickers, days_back=7)
+        raw_articles = await self._fmp.get_batch_stock_news(tickers, days_back=self._days_back)
 
         all_new_articles: list[dict[str, Any]] = []
         for symbol, articles in raw_articles.items():
@@ -245,29 +226,18 @@ class ETLPipeline:
         if not all_new_articles:
             return []
 
-        # Process through LLM
         processed = await self._llm.process_articles(all_new_articles)
-
-        # Convert to FeedEvents
-        events = []
+        events: list[FeedEvent] = []
         for article, llm_result in zip(all_new_articles, processed):
             event = self._build_article_event(article, llm_result)
             if event:
                 events.append(event)
-
         return events
 
-    async def _fetch_congress_trades(
-        self, tickers: list[str]
-    ) -> list[dict[str, Any]]:
-        """Fetch Congress trading data.
-
-        Uses CongressClient to fetch from Quiver Quantitative or Capitol Trades API.
-        """
+    async def _fetch_congress_trades(self, tickers: list[str]) -> list[dict[str, Any]]:
         try:
             raw_trades = await self._congress.get_congress_trades(
-                tickers=tickers,
-                days_back=7,
+                tickers=tickers, days_back=self._days_back
             )
             logger.info(f"Fetched {len(raw_trades)} Congress trades")
             return raw_trades
@@ -278,7 +248,6 @@ class ETLPipeline:
     def _build_congress_event(
         self, raw: dict[str, Any], llm_result: dict[str, Any]
     ) -> FeedEvent | None:
-        """Build a FeedEvent from Congress trade data."""
         try:
             ticker = raw.get("ticker", "")
             event_id = compute_congress_event_id(
@@ -291,18 +260,15 @@ class ETLPipeline:
 
             actor = Actor(
                 nameEn=f"{raw.get('firstName', '')} {raw.get('lastName', '')}".strip(),
-                nameZh=llm_result.get("titleZh", "").split(" - ")[0] if " - " in llm_result.get("titleZh", "") else raw.get("lastName", ""),
+                nameZh=llm_result.get("titleZh", "").split(" - ")[0]
+                if " - " in llm_result.get("titleZh", "")
+                else raw.get("lastName", ""),
                 identityEn=raw.get("office", ""),
                 identityZh=llm_result.get("identityZh", raw.get("office", "")),
             )
 
-            action = ActionType.BUY if raw.get("type", "").upper() == "P" else ActionType.SELL
-
-            financials = Financials(
-                action=action,
-                valueRange=raw.get("amount", ""),
-            )
-
+            action = parse_action_type(raw.get("type", ""))
+            financials = Financials(action=action, valueRange=raw.get("amount", ""))
             content = Content(
                 titleEn=raw.get("assetDescription", ""),
                 titleZh=llm_result.get("titleZh", ""),
@@ -310,13 +276,7 @@ class ETLPipeline:
                 bodyZh=llm_result.get("bodyZh", ""),
             )
 
-            event_time = datetime.now(timezone.utc)
-            if raw.get("disclosureDate"):
-                try:
-                    event_time = datetime.fromisoformat(raw["disclosureDate"])
-                except (ValueError, TypeError):
-                    pass
-
+            event_time = self._parse_event_time(raw.get("disclosureDate"))
             return FeedEvent(
                 eventId=event_id,
                 source=EventSource.CONGRESS,
@@ -334,30 +294,27 @@ class ETLPipeline:
     def _build_insider_event(
         self, raw: dict[str, Any], llm_result: dict[str, Any]
     ) -> FeedEvent | None:
-        """Build a FeedEvent from insider trade data."""
         try:
             symbol = raw.get("_symbol", raw.get("symbol", ""))
             event_id = raw.get("_eventId", "")
-
             insider_name = raw.get("insiderName", "")
+
             actor = Actor(
                 nameEn=insider_name,
-                nameZh=llm_result.get("titleZh", "").split(" - ")[0] if " - " in llm_result.get("titleZh", "") else insider_name,
+                nameZh=llm_result.get("titleZh", "").split(" - ")[0]
+                if " - " in llm_result.get("titleZh", "")
+                else insider_name,
                 identityEn=raw.get("typeOfOwner", ""),
                 identityZh=llm_result.get("identityZh", raw.get("typeOfOwner", "")),
             )
 
-            tx_type = raw.get("transactionType", "S")
-            action = ActionType.BUY if tx_type.upper() in ("P", "PURCHASE") else ActionType.SELL
-
-            shares = float(raw.get("securitiesTransacted", 0))
-            price = float(raw.get("price", 0))
-            financials = Financials(
-                action=action,
-                price=price,
-                volume=shares,
+            action = parse_action_type(
+                raw.get("transactionType", ""),
+                raw.get("acquisitionOrDisposition"),
             )
-
+            shares = float(raw.get("securitiesTransacted", 0))
+            price = float(raw.get("price", 0) or 0)
+            financials = Financials(action=action, price=price, volume=shares)
             content = Content(
                 titleEn=f"{insider_name} {action.value} {shares} shares of {symbol}",
                 titleZh=llm_result.get("titleZh", ""),
@@ -365,13 +322,7 @@ class ETLPipeline:
                 bodyZh=llm_result.get("bodyZh", ""),
             )
 
-            event_time = datetime.now(timezone.utc)
-            if raw.get("filingDate"):
-                try:
-                    event_time = datetime.fromisoformat(raw["filingDate"])
-                except (ValueError, TypeError):
-                    pass
-
+            event_time = self._parse_event_time(raw.get("filingDate"))
             return FeedEvent(
                 eventId=event_id,
                 source=EventSource.INSIDER,
@@ -389,7 +340,6 @@ class ETLPipeline:
     def _build_article_event(
         self, raw: dict[str, Any], llm_result: dict[str, Any]
     ) -> FeedEvent | None:
-        """Build a FeedEvent from news article data."""
         try:
             symbol = raw.get("_symbol", raw.get("symbol", ""))
             event_id = raw.get("_eventId", "")
@@ -400,7 +350,6 @@ class ETLPipeline:
                 identityEn="Financial News",
                 identityZh="金融新闻",
             )
-
             content = Content(
                 titleEn=raw.get("title", ""),
                 titleZh=llm_result.get("titleZh", ""),
@@ -408,13 +357,7 @@ class ETLPipeline:
                 bodyZh=llm_result.get("bodyZh", ""),
             )
 
-            event_time = datetime.now(timezone.utc)
-            if raw.get("publishedDate"):
-                try:
-                    event_time = datetime.fromisoformat(raw["publishedDate"])
-                except (ValueError, TypeError):
-                    pass
-
+            event_time = self._parse_event_time(raw.get("publishedDate"))
             return FeedEvent(
                 eventId=event_id,
                 source=EventSource.ARTICLE,
@@ -428,41 +371,80 @@ class ETLPipeline:
             logger.error(f"Failed to build article event: {e}")
             return None
 
-    def _store_feeds(
+    @staticmethod
+    def _parse_event_time(raw_value: Any) -> datetime:
+        if raw_value:
+            try:
+                return datetime.fromisoformat(str(raw_value).replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                pass
+        return datetime.now(timezone.utc)
+
+    def _merge_feed_dicts(
         self,
-        all_events: list[FeedEvent],
-        congress_events: list[FeedEvent],
-        insider_events: list[FeedEvent],
-    ) -> None:
-        """Store feeds to R2 storage."""
-        # Store latest_feeds.json
-        feeds_data = [event.model_dump(by_alias=True) for event in all_events]
-        self._r2.put_object("feeds/latest_feeds.json", feeds_data)
+        existing: list[dict[str, Any]],
+        new_events: list[FeedEvent],
+    ) -> list[dict[str, Any]]:
+        by_id = {item["eventId"]: item for item in existing if item.get("eventId")}
+        for event in new_events:
+            by_id[event.event_id] = event.model_dump(by_alias=True)
+        merged = list(by_id.values())
+        merged.sort(key=lambda item: item.get("eventTimestamp", ""), reverse=True)
+        return merged[: self._max_feed_items]
 
-        # Generate and store RSS feeds
-        congress_rss = generate_congress_rss(congress_events)
-        self._r2.put_xml_object("feeds/rss_congress.xml", congress_rss)
+    @staticmethod
+    def _feed_dicts_to_events(
+        feed_dicts: list[dict[str, Any]],
+        source: EventSource,
+    ) -> list[FeedEvent]:
+        events: list[FeedEvent] = []
+        for item in feed_dicts:
+            if item.get("source") != source.value:
+                continue
+            try:
+                events.append(FeedEvent.model_validate(item))
+            except Exception as e:
+                logger.warning(f"Skipping invalid feed item {item.get('eventId')}: {e}")
+        return events
 
-        insider_rss = generate_insider_rss(insider_events)
-        self._r2.put_xml_object("feeds/rss_insider.xml", insider_rss)
+    def _store_feeds(self, new_events: list[FeedEvent]) -> None:
+        """Merge new events into existing feeds and persist snapshots."""
+        existing = self._r2.load_latest_feeds()
+        merged = self._merge_feed_dicts(existing, new_events)
 
-        # Store per-ticker feeds
-        ticker_events: dict[str, list[FeedEvent]] = {}
-        for event in all_events:
-            if event.ticker not in ticker_events:
-                ticker_events[event.ticker] = []
-            ticker_events[event.ticker].append(event)
+        if self._dry_run:
+            logger.info(
+                f"DRY_RUN: would store {len(merged)} total feeds "
+                f"({len(new_events)} new)"
+            )
+            return
 
-        for ticker, events in ticker_events.items():
-            ticker_data = [e.model_dump(by_alias=True) for e in events]
-            self._r2.put_object(f"symbols/{ticker}.json", ticker_data)
+        self._r2.put_object("feeds/latest_feeds.json", merged)
+
+        congress_events = self._feed_dicts_to_events(merged, EventSource.CONGRESS)
+        insider_events = self._feed_dicts_to_events(merged, EventSource.INSIDER)
+
+        self._r2.put_xml_object(
+            "feeds/rss_congress.xml",
+            generate_congress_rss(congress_events),
+        )
+        self._r2.put_xml_object(
+            "feeds/rss_insider.xml",
+            generate_insider_rss(insider_events),
+        )
+
+        tickers_with_new_data = {event.ticker for event in new_events if event.ticker}
+        for ticker in tickers_with_new_data:
+            existing_ticker = self._r2.load_ticker_feeds(ticker)
+            ticker_new = [event for event in new_events if event.ticker == ticker]
+            merged_ticker = self._merge_feed_dicts(existing_ticker, ticker_new)
+            self._r2.put_object(f"symbols/{ticker}.json", merged_ticker)
 
     def _update_sliding_window(
         self,
         window: dict[str, datetime],
         events: list[FeedEvent],
     ) -> None:
-        """Update the sliding window with new events."""
         now = datetime.now(timezone.utc)
         for event in events:
             window[event.event_id] = now

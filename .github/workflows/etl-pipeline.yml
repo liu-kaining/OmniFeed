@@ -1,25 +1,28 @@
 # OmniFeed ETL Pipeline
 #
-# This workflow runs the ETL pipeline every 2 hours to fetch,
-# process, and store financial intelligence data.
+# Runs every 2 hours. All secrets documented in config/README.md
 
 name: OmniFeed ETL Pipeline
 
 on:
-  # Run every 2 hours
   schedule:
     - cron: '0 */2 * * *'
-
-  # Allow manual trigger
   workflow_dispatch:
     inputs:
       dry_run:
         description: 'Dry run (no R2 writes)'
         required: false
-        default: 'false'
+        default: false
         type: boolean
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/**'
+      - 'config/**'
+      - 'requirements.txt'
+      - '.github/workflows/etl-pipeline.yml'
 
-# Prevent concurrent runs
 concurrency:
   group: etl-pipeline
   cancel-in-progress: true
@@ -50,18 +53,27 @@ jobs:
 
       - name: Run ETL pipeline
         env:
+          # --- Required secrets (see config/README.md) ---
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
-          LLM_MODE: ${{ secrets.LLM_MODE || 'SDK_MODE' }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL || 'https://api.deepseek.com/v1' }}
-          LLM_MODEL: ${{ secrets.LLM_MODEL || 'deepseek-chat' }}
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME || 'omnifeed-bucket' }}
-          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
-        run: |
-          python -m src.main
+          # --- Optional secrets ---
+          QUIVER_API_KEY: ${{ secrets.QUIVER_API_KEY }}
+          LLM_MODE: ${{ secrets.LLM_MODE }}
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+          LLM_CHUNK_SIZE: ${{ secrets.LLM_CHUNK_SIZE }}
+          LLM_MAX_FAILURES: ${{ secrets.LLM_MAX_FAILURES }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+          ETL_DAYS_BACK: ${{ secrets.ETL_DAYS_BACK }}
+          ETL_MAX_FEED_ITEMS: ${{ secrets.ETL_MAX_FEED_ITEMS }}
+          FMP_BASE_URL: ${{ secrets.FMP_BASE_URL }}
+          FMP_INSIDER_LIMIT: ${{ secrets.FMP_INSIDER_LIMIT }}
+          FMP_NEWS_LIMIT: ${{ secrets.FMP_NEWS_LIMIT }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run && 'true' || 'false' }}
+        run: python -m src.main
 
       - name: Upload logs
         if: always()

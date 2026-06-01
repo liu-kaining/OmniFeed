@@ -5,24 +5,14 @@
  * to prevent concurrent write conflicts.
  */
 
-// Input validation regex: 1-5 uppercase letters only
 const TICKER_REGEX = /^[A-Z]{1,5}$/;
-
-// Turnstile verification endpoint
 const TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
-
-// Random delay range for retry (ms)
 const MIN_RETRY_DELAY = 100;
 const MAX_RETRY_DELAY = 300;
-
-// Max retry attempts
 const MAX_RETRIES = 5;
-
-// Rate limiting: max submissions per IP per hour
 const RATE_LIMIT_PER_HOUR = 10;
 
-// Allowed origins for CORS
-const ALLOWED_ORIGINS = [
+const DEFAULT_ALLOWED_ORIGINS = [
   "https://omnifeed.pages.dev",
   "http://localhost:3000",
   "http://localhost:8080",
@@ -32,26 +22,25 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const origin = request.headers.get("Origin") || "";
+    const allowedOrigins = getAllowedOrigins(env);
+    const corsHeaders = buildCorsHeaders(origin, allowedOrigins);
 
-    // CORS headers - restrict to allowed origins
-    const corsHeaders = {
-      "Access-Control-Allow-Origin": ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0],
-      "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type",
-      "Access-Control-Max-Age": "86400",
-    };
-
-    // Handle CORS preflight
     if (request.method === "OPTIONS") {
       return new Response(null, { headers: corsHeaders });
     }
 
-    // Route: POST /api/submit-ticker
     if (url.pathname === "/api/submit-ticker" && request.method === "POST") {
+      const allowed = await checkRateLimit(request);
+      if (!allowed) {
+        return jsonResponse(
+          { error: "Rate limit exceeded. Please try again later." },
+          429,
+          corsHeaders
+        );
+      }
       return await handleSubmitTicker(request, env, corsHeaders);
     }
 
-    // Route: GET /api/whitelist
     if (url.pathname === "/api/whitelist" && request.method === "GET") {
       return await handleGetWhitelist(env, corsHeaders);
     }
@@ -60,37 +49,68 @@ export default {
   },
 };
 
-/**
- * Handle ticker submission with ETag optimistic locking
- */
+function getAllowedOrigins(env) {
+  const extra = (env.ALLOWED_ORIGIN || "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  return [...DEFAULT_ALLOWED_ORIGINS, ...extra];
+}
+
+function buildCorsHeaders(origin, allowedOrigins) {
+  const allowOrigin = allowedOrigins.includes(origin)
+    ? origin
+    : allowedOrigins[0];
+  return {
+    "Access-Control-Allow-Origin": allowOrigin,
+    "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Max-Age": "86400",
+  };
+}
+
+async function checkRateLimit(request) {
+  const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+  const hourBucket = new Date().toISOString().slice(0, 13);
+  const cacheKey = new Request(
+    `https://rate-limit.omnifeed.internal/${encodeURIComponent(ip)}/${hourBucket}`
+  );
+  const cache = caches.default;
+  const cached = await cache.match(cacheKey);
+  const count = cached ? Number.parseInt(await cached.text(), 10) || 0 : 0;
+
+  if (count >= RATE_LIMIT_PER_HOUR) {
+    return false;
+  }
+
+  await cache.put(
+    cacheKey,
+    new Response(String(count + 1), {
+      headers: { "Cache-Control": "max-age=3600" },
+    })
+  );
+  return true;
+}
+
 async function handleSubmitTicker(request, env, corsHeaders) {
   try {
-    // Parse request body
     const body = await request.json();
     const { ticker, turnstileToken } = body;
 
-    // Validate ticker format
     if (!ticker || typeof ticker !== "string") {
-      return jsonResponse(
-        { error: "Ticker symbol is required" },
-        400,
-        corsHeaders
-      );
+      return jsonResponse({ error: "Ticker symbol is required" }, 400, corsHeaders);
     }
 
-    // Sanitize: trim whitespace and uppercase
     const sanitizedTicker = ticker.trim().toUpperCase();
 
-    // Additional security: block common injection patterns
-    if (sanitizedTicker.includes('..') || sanitizedTicker.includes('/') || sanitizedTicker.includes('\\')) {
-      return jsonResponse(
-        { error: "Invalid ticker format" },
-        400,
-        corsHeaders
-      );
+    if (
+      sanitizedTicker.includes("..") ||
+      sanitizedTicker.includes("/") ||
+      sanitizedTicker.includes("\\")
+    ) {
+      return jsonResponse({ error: "Invalid ticker format" }, 400, corsHeaders);
     }
 
-    // Regex validation: 1-5 uppercase letters only
     if (!TICKER_REGEX.test(sanitizedTicker)) {
       return jsonResponse(
         {
@@ -101,14 +121,9 @@ async function handleSubmitTicker(request, env, corsHeaders) {
       );
     }
 
-    // Verify Turnstile token (required)
     if (!env.TURNSTILE_SECRET_KEY) {
       console.error("TURNSTILE_SECRET_KEY not configured");
-      return jsonResponse(
-        { error: "Service configuration error" },
-        500,
-        corsHeaders
-      );
+      return jsonResponse({ error: "Service configuration error" }, 500, corsHeaders);
     }
 
     if (!turnstileToken) {
@@ -131,7 +146,6 @@ async function handleSubmitTicker(request, env, corsHeaders) {
       );
     }
 
-    // Attempt to add ticker with optimistic locking
     const result = await addTickerWithRetry(sanitizedTicker, env);
 
     if (result.success) {
@@ -143,7 +157,9 @@ async function handleSubmitTicker(request, env, corsHeaders) {
         200,
         corsHeaders
       );
-    } else if (result.alreadyExists) {
+    }
+
+    if (result.alreadyExists) {
       return jsonResponse(
         {
           message: `Ticker ${sanitizedTicker} is already being monitored`,
@@ -152,102 +168,78 @@ async function handleSubmitTicker(request, env, corsHeaders) {
         409,
         corsHeaders
       );
-    } else {
-      return jsonResponse(
-        { error: "Failed to add ticker after multiple attempts. Please try again." },
-        500,
-        corsHeaders
-      );
     }
-  } catch (error) {
-    console.error("Error in handleSubmitTicker:", error);
+
     return jsonResponse(
-      { error: "Internal server error" },
+      { error: "Failed to add ticker after multiple attempts. Please try again." },
       500,
       corsHeaders
     );
+  } catch (error) {
+    console.error("Error in handleSubmitTicker:", error);
+    return jsonResponse({ error: "Internal server error" }, 500, corsHeaders);
   }
 }
 
-/**
- * Add ticker with ETag optimistic locking and retry logic
- */
 async function addTickerWithRetry(ticker, env) {
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
-      // Step 1: GET whitelist.json and capture ETag
       const { data, etag } = await getWhitelistWithETag(env);
-
-      // Check if ticker already exists
       const tickers = data.tickers || [];
+
       if (tickers.includes(ticker)) {
         return { success: false, alreadyExists: true };
       }
 
-      // Step 2: Add ticker to array
-      const updatedTickers = [...tickers, ticker];
       const updatedData = {
         ...data,
-        tickers: updatedTickers,
+        tickers: [...tickers, ticker],
         lastUpdated: new Date().toISOString(),
       };
 
-      // Step 3: PUT with If-Match ETag
       const putResult = await putWhitelistWithETag(updatedData, etag, env);
-
       if (putResult.success) {
         return { success: true, alreadyExists: false };
       }
 
-      // ETag mismatch - wait and retry
       if (putResult.conflict) {
-        const delay =
-          MIN_RETRY_DELAY +
-          Math.random() * (MAX_RETRY_DELAY - MIN_RETRY_DELAY);
-        await sleep(delay);
+        await sleep(
+          MIN_RETRY_DELAY + Math.random() * (MAX_RETRY_DELAY - MIN_RETRY_DELAY)
+        );
         continue;
       }
 
-      // Other error
       return { success: false, alreadyExists: false };
     } catch (error) {
       console.error(`Attempt ${attempt + 1} failed:`, error);
       if (attempt === MAX_RETRIES - 1) {
         return { success: false, alreadyExists: false };
       }
-      const delay =
-        MIN_RETRY_DELAY +
-        Math.random() * (MAX_RETRY_DELAY - MIN_RETRY_DELAY);
-      await sleep(delay);
+      await sleep(
+        MIN_RETRY_DELAY + Math.random() * (MAX_RETRY_DELAY - MIN_RETRY_DELAY)
+      );
     }
   }
 
   return { success: false, alreadyExists: false };
 }
 
-/**
- * Get whitelist.json from R2 with ETag
- */
 async function getWhitelistWithETag(env) {
   const object = await env.R2_BUCKET.get("config/whitelist.json");
 
   if (!object) {
-    // Initialize empty whitelist
     return {
       data: { tickers: [], lastUpdated: new Date().toISOString() },
       etag: null,
     };
   }
 
-  const data = await object.json();
-  const etag = object.httpEtag;
-
-  return { data, etag };
+  return {
+    data: await object.json(),
+    etag: object.httpEtag,
+  };
 }
 
-/**
- * Put whitelist.json to R2 with ETag conditional write
- */
 async function putWhitelistWithETag(data, etag, env) {
   try {
     const options = {
@@ -256,11 +248,8 @@ async function putWhitelistWithETag(data, etag, env) {
       },
     };
 
-    // Add If-Match header if we have an ETag
     if (etag) {
-      options.onlyIf = {
-        etagMatches: etag,
-      };
+      options.onlyIf = { etagMatches: etag };
     }
 
     const result = await env.R2_BUCKET.put(
@@ -270,7 +259,6 @@ async function putWhitelistWithETag(data, etag, env) {
     );
 
     if (!result) {
-      // ETag mismatch (412 Precondition Failed)
       return { success: false, conflict: true };
     }
 
@@ -281,9 +269,6 @@ async function putWhitelistWithETag(data, etag, env) {
   }
 }
 
-/**
- * Get current whitelist
- */
 async function handleGetWhitelist(env, corsHeaders) {
   try {
     const object = await env.R2_BUCKET.get("config/whitelist.json");
@@ -292,28 +277,18 @@ async function handleGetWhitelist(env, corsHeaders) {
       return jsonResponse({ tickers: [] }, 200, corsHeaders);
     }
 
-    const data = await object.json();
-    return jsonResponse(data, 200, corsHeaders);
+    return jsonResponse(await object.json(), 200, corsHeaders);
   } catch (error) {
     console.error("Error getting whitelist:", error);
-    return jsonResponse(
-      { error: "Failed to get whitelist" },
-      500,
-      corsHeaders
-    );
+    return jsonResponse({ error: "Failed to get whitelist" }, 500, corsHeaders);
   }
 }
 
-/**
- * Verify Cloudflare Turnstile token
- */
 async function verifyTurnstile(token, secretKey) {
   try {
     const response = await fetch(TURNSTILE_VERIFY_URL, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
         secret: secretKey,
         response: token,
@@ -328,9 +303,6 @@ async function verifyTurnstile(token, secretKey) {
   }
 }
 
-/**
- * Helper: JSON response
- */
 function jsonResponse(data, status, headers = {}) {
   return new Response(JSON.stringify(data), {
     status,
@@ -341,9 +313,6 @@ function jsonResponse(data, status, headers = {}) {
   });
 }
 
-/**
- * Helper: Sleep
- */
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }

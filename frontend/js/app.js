@@ -5,8 +5,10 @@
  */
 
 // API endpoints
-const API_BASE = window.OMNIFEED_API_BASE || '/api';
-const FEEDS_BASE = window.OMNIFEED_FEEDS_BASE || '';
+const CONFIG = window.OMNIFEED_CONFIG || {};
+const API_BASE = CONFIG.apiBase || window.OMNIFEED_API_BASE || '/api';
+const FEEDS_BASE = CONFIG.feedsBase || window.OMNIFEED_FEEDS_BASE || '';
+const TURNSTILE_SITE_KEY = CONFIG.turnstileSiteKey || window.OMNIFEED_TURNSTILE_SITE_KEY || '';
 const FEEDS_URL = `${FEEDS_BASE}/feeds/latest_feeds.json`;
 const SYMBOLS_URL = `${FEEDS_BASE}/symbols/`;
 
@@ -18,6 +20,8 @@ const state = {
     activeTicker: null,
     activeView: 'timeline',
     isLoading: true,
+    turnstileToken: null,
+    turnstileWidgetId: null,
 };
 
 // DOM elements
@@ -39,6 +43,7 @@ function escapeHtml(str) {
 document.addEventListener('DOMContentLoaded', async () => {
     initializeElements();
     setupEventListeners();
+    initTurnstile();
     await loadData();
 });
 
@@ -54,6 +59,7 @@ function initializeElements() {
     elements.tickerInput = document.getElementById('tickerInput');
     elements.submitForm = document.getElementById('submitForm');
     elements.submitMessage = document.getElementById('submitMessage');
+    elements.turnstileContainer = document.getElementById('turnstileContainer');
     elements.rawJsonModal = document.getElementById('rawJsonModal');
     elements.jsonContent = document.getElementById('jsonContent');
 }
@@ -365,12 +371,17 @@ function createFeedCard(feed) {
         `;
     }
 
-    // Highlight AI insight
+    // Highlight AI insight (escape first, then wrap matched segment)
     const bodyZh = feed.content.bodyZh || '';
     const insightMatch = bodyZh.match(/(🤖.*?(?:。|$))/);
-    const insightHtml = insightMatch ?
-        bodyZh.replace(insightMatch[0], `<span class="feed-insight">${insightMatch[0]}</span>`) :
-        bodyZh;
+    let bodyHtml = escapeHtml(bodyZh);
+    if (insightMatch) {
+        const escapedInsight = escapeHtml(insightMatch[0]);
+        bodyHtml = bodyHtml.replace(
+            escapedInsight,
+            `<span class="feed-insight">${escapedInsight}</span>`
+        );
+    }
 
     card.innerHTML = `
         <div class="feed-card-header">
@@ -394,7 +405,7 @@ function createFeedCard(feed) {
 
         <div class="feed-content">
             <div class="feed-title-zh">${escapeHtml(feed.content.titleZh)}</div>
-            <div class="feed-body-zh">${escapeHtml(feed.content.bodyZh)}</div>
+            <div class="feed-body-zh">${bodyHtml}</div>
         </div>
 
         <div class="feed-footer">
@@ -465,6 +476,11 @@ async function submitTicker() {
         return;
     }
 
+    if (TURNSTILE_SITE_KEY && !getTurnstileToken()) {
+        showMessage('请完成人机验证', 'error');
+        return;
+    }
+
     try {
         showMessage('提交中...', '');
 
@@ -479,12 +495,18 @@ async function submitTicker() {
 
         const data = await response.json();
 
-        if (response.ok) {
-            showMessage(`${ticker} 已成功添加到监控列表`, 'success');
-            state.tickers.push(ticker);
-            state.tickers.sort();
-            renderTickerGrid();
+        if (response.ok || response.status === 409) {
+            showMessage(
+                data.message || `${ticker} 已成功添加到监控列表`,
+                'success'
+            );
+            if (!state.tickers.includes(ticker)) {
+                state.tickers.push(ticker);
+                state.tickers.sort();
+                renderTickerGrid();
+            }
             elements.tickerInput.value = '';
+            resetTurnstile();
 
             // Hide form after success
             setTimeout(() => {
@@ -501,11 +523,75 @@ async function submitTicker() {
 }
 
 /**
- * Get Turnstile token (placeholder)
+ * Initialize Cloudflare Turnstile widget
+ */
+function initTurnstile() {
+    if (!TURNSTILE_SITE_KEY || !elements.turnstileContainer) {
+        return;
+    }
+
+    loadTurnstileScript(() => {
+        if (!window.turnstile) {
+            console.warn('Turnstile script loaded but API unavailable');
+            return;
+        }
+
+        state.turnstileWidgetId = window.turnstile.render(elements.turnstileContainer, {
+            sitekey: TURNSTILE_SITE_KEY,
+            callback: (token) => {
+                state.turnstileToken = token;
+            },
+            'expired-callback': () => {
+                state.turnstileToken = null;
+            },
+            'error-callback': () => {
+                state.turnstileToken = null;
+            },
+        });
+    });
+}
+
+function loadTurnstileScript(onReady) {
+    if (window.turnstile) {
+        onReady();
+        return;
+    }
+
+    const existing = document.querySelector('script[data-turnstile="true"]');
+    if (existing) {
+        existing.addEventListener('load', onReady, { once: true });
+        return;
+    }
+
+    const script = document.createElement('script');
+    script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+    script.async = true;
+    script.defer = true;
+    script.dataset.turnstile = 'true';
+    script.addEventListener('load', onReady, { once: true });
+    document.head.appendChild(script);
+}
+
+/**
+ * Get Turnstile token
  */
 function getTurnstileToken() {
-    // In production, this would get the token from Cloudflare Turnstile widget
+    if (state.turnstileToken) {
+        return state.turnstileToken;
+    }
+
+    if (window.turnstile && state.turnstileWidgetId !== null) {
+        return window.turnstile.getResponse(state.turnstileWidgetId) || '';
+    }
+
     return '';
+}
+
+function resetTurnstile() {
+    state.turnstileToken = null;
+    if (window.turnstile && state.turnstileWidgetId !== null) {
+        window.turnstile.reset(state.turnstileWidgetId);
+    }
 }
 
 /**
@@ -548,7 +634,7 @@ function showLoading(show) {
 function showError(message) {
     elements.feedList.innerHTML = `
         <div class="loading">
-            <p style="color: var(--accent-red);">⚠️ ${message}</p>
+            <p style="color: var(--accent-red);">⚠️ ${escapeHtml(message)}</p>
         </div>
     `;
 }

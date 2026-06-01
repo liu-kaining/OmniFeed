@@ -5,6 +5,7 @@ following the XML structure specified in the OmniFeed specification.
 """
 
 from datetime import datetime, timezone
+from email.utils import format_datetime
 from typing import Optional
 
 from src.models.feed import EventSource, FeedEvent
@@ -20,10 +21,12 @@ def _escape_cdata(text: str) -> str:
 
 
 def _format_rss_date(dt: datetime) -> str:
-    """Format datetime to RSS date format (RFC 822)."""
+    """Format datetime to RSS date format (RFC 822) in UTC."""
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.strftime("%a, %d %b %Y %H:%M:%S GMT")
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return format_datetime(dt, usegmt=True)
 
 
 def _build_description(event: FeedEvent) -> str:

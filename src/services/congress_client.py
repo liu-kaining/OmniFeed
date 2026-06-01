@@ -56,15 +56,14 @@ class CongressClient:
             List of Congress trade records in standardized format.
         """
         try:
-            # Try Quiver Quantitative API first
             trades = await self._fetch_from_quiver(tickers, days_back)
             if trades:
-                return self._normalize_quiver_trades(trades)
+                normalized = self._normalize_quiver_trades(trades)
+                return self._filter_by_days_back(normalized, days_back)
         except Exception as e:
             logger.warning(f"Quiver API failed: {e}")
 
         try:
-            # Fallback to Capitol Trades (free, no API key required)
             trades = await self._fetch_from_capitol_trades(tickers, days_back)
             if trades:
                 return self._normalize_capitol_trades(trades)
@@ -83,9 +82,9 @@ class CongressClient:
 
         Requires QUIVER_API_KEY environment variable.
         """
-        api_key = self._config.fmp.api_key if self._config else None
+        api_key = self._config.quiver.api_key if self._config else ""
         if not api_key:
-            raise ValueError("API key not configured for Quiver")
+            raise ValueError("QUIVER_API_KEY not configured")
 
         headers = {"X-API-KEY": api_key}
         params: dict[str, Any] = {}
@@ -144,6 +143,31 @@ class CongressClient:
                 filtered.append(trade)
 
         return filtered
+
+    def _filter_by_days_back(
+        self,
+        trades: list[dict[str, Any]],
+        days_back: int,
+    ) -> list[dict[str, Any]]:
+        """Keep trades within the lookback window."""
+        cutoff = datetime.now() - timedelta(days=days_back)
+        filtered: list[dict[str, Any]] = []
+        for trade in trades:
+            trade_time = self._parse_trade_date(
+                trade.get("disclosureDate") or trade.get("transactionDate")
+            )
+            if trade_time is not None and trade_time >= cutoff:
+                filtered.append(trade)
+        return filtered
+
+    @staticmethod
+    def _parse_trade_date(raw_value: Any) -> datetime | None:
+        if not raw_value:
+            return None
+        try:
+            return datetime.fromisoformat(str(raw_value).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
 
     def _normalize_quiver_trades(
         self, trades: list[dict[str, Any]]

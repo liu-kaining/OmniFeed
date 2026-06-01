@@ -1,22 +1,21 @@
 # OmniFeed Frontend Deployment
 #
-# This workflow deploys the frontend to Cloudflare Pages.
+# Generates frontend/config.js from secrets, then deploys to Cloudflare Pages.
+# All secrets documented in config/README.md
 
 name: Deploy Frontend
 
 on:
-  # Trigger on push to main branch (frontend changes)
   push:
     branches:
       - main
     paths:
       - 'frontend/**'
+      - 'config/**'
+      - 'scripts/generate_frontend_config.py'
       - '.github/workflows/deploy-frontend.yml'
-
-  # Allow manual trigger
   workflow_dispatch:
 
-# Cancel in-progress deployments
 concurrency:
   group: deploy-frontend
   cancel-in-progress: true
@@ -30,6 +29,21 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install python-dotenv
+
+      - name: Generate frontend config
+        env:
+          OMNIFEED_API_BASE: ${{ secrets.OMNIFEED_API_BASE }}
+          OMNIFEED_FEEDS_BASE: ${{ secrets.OMNIFEED_FEEDS_BASE }}
+          TURNSTILE_SITE_KEY: ${{ secrets.TURNSTILE_SITE_KEY }}
+        run: python scripts/generate_frontend_config.py
 
       - name: Deploy to Cloudflare Pages
         uses: cloudflare/wrangler-action@v3

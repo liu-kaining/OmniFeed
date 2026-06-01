@@ -18,10 +18,9 @@ from src.utils.config import LLMConfig
 
 logger = logging.getLogger(__name__)
 
-# Circuit breaker state
 _circuit_open = False
 _failure_count = 0
-_MAX_FAILURES = 3
+_max_failures = 3
 _CIRCUIT_R2_KEY = "snapshot/circuit_breaker.json"
 _r2_client: Any = None  # Will be set by ETL pipeline
 
@@ -30,6 +29,12 @@ def set_r2_client(r2_client: Any) -> None:
     """Set R2 client for circuit breaker persistence."""
     global _r2_client
     _r2_client = r2_client
+
+
+def configure_circuit_breaker(max_failures: int) -> None:
+    """Configure circuit breaker threshold from app config."""
+    global _max_failures
+    _max_failures = max(1, max_failures)
 
 
 def _load_circuit_state() -> None:
@@ -80,16 +85,17 @@ def _record_failure() -> None:
     """Record a failure and potentially open the circuit."""
     global _circuit_open, _failure_count
     _failure_count += 1
-    if _failure_count >= _MAX_FAILURES:
+    if _failure_count >= _max_failures:
         _circuit_open = True
         logger.warning("LLM circuit breaker opened due to repeated failures")
     _save_circuit_state()
 
 
 def _record_success() -> None:
-    """Record a success and reset failure count."""
-    global _failure_count
+    """Record a success and reset failure count / close circuit."""
+    global _failure_count, _circuit_open
     _failure_count = 0
+    _circuit_open = False
     _save_circuit_state()
 
 
@@ -105,7 +111,7 @@ For each trade, provide:
 Input data (JSON array):
 {data}
 
-Respond with a JSON array where each element has:
+Respond with a JSON object containing a "results" array where each element has:
 - "titleZh": Chinese title for the trade
 - "bodyZh": Chinese body with AI insight starting with "🤖 AI 投资洞察："
 - "identityZh": Chinese identity including party and committee
@@ -122,7 +128,7 @@ For each trade, provide:
 Input data (JSON array):
 {data}
 
-Respond with a JSON array where each element has:
+Respond with a JSON object containing a "results" array where each element has:
 - "titleZh": Chinese title for the trade
 - "bodyZh": Chinese body with transaction analysis
 - "identityZh": Chinese identity/role
@@ -139,7 +145,7 @@ For each article, provide:
 Input data (JSON array):
 {data}
 
-Respond with a JSON array where each element has:
+Respond with a JSON object containing a "results" array where each element has:
 - "titleZh": Structured Chinese translation of the title
 - "bodyZh": Chinese summary with key investment signals
 """
@@ -150,6 +156,7 @@ class LLMGateway:
 
     def __init__(self, config: Optional[LLMConfig] = None) -> None:
         self._config = config or LLMConfig()
+        configure_circuit_breaker(self._config.max_failures)
         self._sdk_client: Optional[AsyncOpenAI] = None
         self._http_client: Optional[httpx.AsyncClient] = None
 
@@ -228,7 +235,7 @@ class LLMGateway:
         Raises:
             Exception: If the circuit breaker is open or the call fails.
         """
-        if _circuit_open:
+        if is_circuit_open():
             logger.warning("Circuit breaker is open, using fallback")
             raise RuntimeError("LLM circuit breaker is open")
 
@@ -279,6 +286,20 @@ class LLMGateway:
             return [parsed]
         return []
 
+    def _align_results(
+        self,
+        inputs: list[dict[str, Any]],
+        results: list[dict[str, Any]],
+        fallback_fn: Any,
+    ) -> list[dict[str, Any]]:
+        """Ensure LLM output count matches input count to prevent zip misalignment."""
+        if len(results) >= len(inputs):
+            return results[: len(inputs)]
+        aligned = list(results)
+        if len(results) < len(inputs):
+            aligned.extend(fallback_fn(inputs[len(results) :]))
+        return aligned
+
     async def process_congress_trades(
         self, trades: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
@@ -304,7 +325,7 @@ class LLMGateway:
                 logger.error(f"Failed to process congress batch: {e}")
                 all_results.extend(self._fallback_congress(chunk))
 
-        return all_results
+        return self._align_results(trades, all_results, self._fallback_congress)
 
     async def process_insider_trades(
         self, trades: list[dict[str, Any]]
@@ -331,7 +352,7 @@ class LLMGateway:
                 logger.error(f"Failed to process insider batch: {e}")
                 all_results.extend(self._fallback_insider(chunk))
 
-        return all_results
+        return self._align_results(trades, all_results, self._fallback_insider)
 
     async def process_articles(
         self, articles: list[dict[str, Any]]
@@ -358,15 +379,18 @@ class LLMGateway:
                 logger.error(f"Failed to process article batch: {e}")
                 all_results.extend(self._fallback_articles(chunk))
 
-        return all_results
+        return self._align_results(articles, all_results, self._fallback_articles)
 
     def _fallback_congress(self, trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Fallback for Congress trades when LLM is unavailable."""
         return [
             {
-                "titleZh": f"[暂无AI翻译] {t.get('representative', '')} - {t.get('assetDescription', '')}",
+                "titleZh": (
+                    f"[暂无AI翻译] {t.get('firstName', '')} {t.get('lastName', '')} - "
+                    f"{t.get('assetDescription', '')}"
+                ).strip(),
                 "bodyZh": "LLM网关瞬时拥堵，AI分析延迟注入。",
-                "identityZh": f"联邦众议员 ({t.get('stateDistrict', '')})",
+                "identityZh": f"{t.get('office', '联邦议员')} ({t.get('stateDistrict', '')})",
             }
             for t in trades
         ]
